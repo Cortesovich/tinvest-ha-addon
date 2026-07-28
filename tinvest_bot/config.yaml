@@ -8,7 +8,7 @@ description: >-
 # ВАЖНО: замени YOURNAME на свой логин GitHub в НИЖНЕМ РЕГИСТРЕ.
 # Дополнение НЕ собирается на сервере, а скачивает готовый образ с ghcr.io
 # (его собирает GitHub Actions). {arch} HA подставит сам (aarch64/amd64).
-image: "ghcr.io/YOURNAME/tinvest-bot-{arch}"
+image: "ghcr.io/cortesovich/tinvest-bot-{arch}"
 
 arch:
   - aarch64
