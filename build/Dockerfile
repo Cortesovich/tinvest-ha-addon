@@ -21,4 +21,7 @@ COPY app/ /app/
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
+# Предохранитель: битый код — сборка падает сразу.
+RUN python -m py_compile /app/main.py /app/bot/*.py
+
 CMD [ "/run.sh" ]
