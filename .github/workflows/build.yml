@@ -1,8 +1,13 @@
 name: build
 
+# Собирает образ бота для aarch64 и amd64 и публикует на ghcr.io.
+# Запускается при каждом коммите в main и вручную (кнопка Run workflow).
 on:
   push:
     branches: [ main ]
+    paths:
+      - "build/**"
+      - ".github/workflows/build.yml"
   workflow_dispatch: {}
 
 permissions:
@@ -26,24 +31,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Owner lowercase
+      - name: Owner в нижнем регистре (для имени образа ghcr)
         id: vars
         run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
-      - name: QEMU
+      - name: QEMU (эмуляция arm64 на amd64-раннере)
         uses: docker/setup-qemu-action@v3
 
       - name: Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login ghcr
+      - name: Вход в ghcr.io
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push ${{ matrix.arch }}
+      - name: Сборка и публикация ${{ matrix.arch }}
         uses: docker/build-push-action@v6
         with:
           context: ./build
@@ -53,5 +58,5 @@ jobs:
             BUILD_FROM=${{ matrix.base }}
           push: true
           tags: |
-            ghcr.io/${{ steps.vars.outputs.owner }}/tinvest-bot-${{ matrix.arch }}:1.1.0
+            ghcr.io/${{ steps.vars.outputs.owner }}/tinvest-bot-${{ matrix.arch }}:1.1.1
             ghcr.io/${{ steps.vars.outputs.owner }}/tinvest-bot-${{ matrix.arch }}:latest
