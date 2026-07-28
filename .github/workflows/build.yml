@@ -53,5 +53,5 @@ jobs:
             BUILD_FROM=${{ matrix.base }}
           push: true
           tags: |
-            ghcr.io/${{ steps.vars.outputs.owner }}/tinvest-bot-${{ matrix.arch }}:1.0.0
+            ghcr.io/${{ steps.vars.outputs.owner }}/tinvest-bot-${{ matrix.arch }}:1.1.0
             ghcr.io/${{ steps.vars.outputs.owner }}/tinvest-bot-${{ matrix.arch }}:latest
