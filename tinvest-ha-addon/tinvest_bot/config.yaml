@@ -1,0 +1,23 @@
+name: TInvest ИИС Bot
+version: "1.0.0"
+slug: tinvest_bot
+description: >-
+  Telegram-бот для ИИС в Т-Инвестициях: баланс, доходность (XIRR), купоны,
+  сроки погашения, подбор и покупка надёжных облигаций и акций.
+
+# ВАЖНО: замени YOURNAME на свой логин GitHub в НИЖНЕМ РЕГИСТРЕ.
+# Дополнение НЕ собирается на сервере, а скачивает готовый образ с ghcr.io
+# (его собирает GitHub Actions). {arch} HA подставит сам (aarch64/amd64).
+image: "ghcr.io/YOURNAME/tinvest-bot-{arch}"
+
+arch:
+  - aarch64
+  - amd64
+# Базовый образ уже содержит s6-overlay — свой init не навязываем.
+init: false
+startup: application
+# Автозапуск при загрузке сервера (24/7). Watchdog включается в интерфейсе.
+boot: auto
+# Доступ к /share — там папка tinvest с .env, config.yaml, csv, логами.
+map:
+  - share:rw
