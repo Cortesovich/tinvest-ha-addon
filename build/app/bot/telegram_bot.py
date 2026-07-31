@@ -255,7 +255,10 @@ class TelegramBot:
 
     # ================= АВТОПОКУПКА =================
     def _notify_owners(self, text: str):
-        for cid in (self.cfg.allowed_chat_ids or []):
+        # Отчёты автопокупки идут владельцам И наблюдателям (второй аккаунт).
+        recipients = list(dict.fromkeys(
+            (self.cfg.allowed_chat_ids or []) + (self.cfg.viewer_chat_ids or [])))
+        for cid in recipients:
             try:
                 self.send(cid, text)
             except Exception:  # noqa: BLE001
@@ -280,32 +283,31 @@ class TelegramBot:
             self._set_autobuy_last(today)          # помечаем ДО покупки — не повторять за день
             log.info("Автопокупка: запуск по расписанию (%s %s)", today, cfg.autobuy_time)
             self._run_autobuy()
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             log.exception("Ошибка планировщика автопокупки")
+            self._notify_owners(f"🤖 <b>Автопокупка</b>\n⚠️ Ошибка, покупка не выполнена: {fmt.esc(e)}")
 
     def _run_autobuy(self):
         cfg = self.cfg
         min_cash = Decimal(str(cfg.autobuy_min_cash))
         free = self.tinvest.get_balance().money
         if free < min_cash:
-            self._notify_owners(f"🤖 <b>Автопокупка</b>\nСвободно {fmt._num(free)} ₽ "
-                                f"(меньше {fmt._num(min_cash)} ₽) — пропускаю.")
+            log.info("Автопокупка: свободно %s < %s — пропускаю (тихо)", free, min_cash)
             return
         cands = self.tinvest.get_reinvest_candidates(
             cfg.bond_min_maturity_days, cfg.bond_max_maturity_days,
             cfg.bond_whitelist, cfg.bond_max_screened)
         if not cands:
-            self._notify_owners("🤖 <b>Автопокупка</b>\nПодходящих облигаций не найдено — пропускаю.")
+            log.info("Автопокупка: подходящих облигаций не найдено — пропускаю (тихо)")
             return
         if self.tinvest.market_is_open(cands[0].figi) is not True:
-            self._notify_owners("🤖 <b>Автопокупка</b>\nБиржа закрыта — пропускаю.")
+            log.info("Автопокупка: биржа закрыта — пропускаю (тихо)")
             return
         items, remaining = TInvestClient.plan_purchase(
             cands, free, cfg.bond_top_n, cfg.reinvest_max_rub)
         buyable = [it for it in items if it.lots > 0]
         if not buyable:
-            self._notify_owners(f"🤖 <b>Автопокупка</b>\nСвободно {fmt._num(free)} ₽, "
-                                f"но не хватает на целый лот — пропускаю.")
+            log.info("Автопокупка: %s ₽ есть, но не хватает на целый лот — пропускаю (тихо)", free)
             return
         acc_id = self.tinvest.trade_account_id()
         results = []
