@@ -32,11 +32,12 @@ try:  # pragma: no cover
 except Exception:
     pass
 
-# Хосты API (оба официальные). tinkoff.ru первым — его сертификат доверен
-# «из коробки»; tbank.ru как резерв (его УЦ подхватится через truststore).
+# Хосты API. tbank.ru — основной (с 2025 старый tinkoff.ru отключён Т-Банком).
+# tbank.ru подписан УЦ Минцифры — доверяем через общий CA-бандл, собранный в
+# образе (см. Dockerfile: REQUESTS_CA_BUNDLE). tinkoff.ru оставлен запасным.
 API_HOSTS = [
-    "https://invest-public-api.tinkoff.ru/rest",
     "https://invest-public-api.tbank.ru/rest",
+    "https://invest-public-api.tinkoff.ru/rest",
 ]
 _CONTRACT = "tinkoff.public.invest.api.contract.v1"
 
