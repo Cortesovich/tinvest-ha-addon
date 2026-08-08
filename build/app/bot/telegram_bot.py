@@ -146,7 +146,8 @@ class TelegramBot:
         free = self.tinvest.get_balance().money
         market_open = self.tinvest.market_is_open(cands[0].figi) if cands else None
         items, remaining = TInvestClient.plan_purchase(
-            cands, free, self.cfg.bond_top_n, self.cfg.reinvest_max_rub)
+            cands, free, self.cfg.bond_top_n, self.cfg.reinvest_max_rub,
+            self.cfg.bond_max_issuer_pct)
 
         planned = free - remaining
         buyable = [it for it in items if it.lots > 0]
@@ -160,7 +161,11 @@ class TelegramBot:
                 "chat_id": chat_id, "status": "proposed",
                 "acc_id": self.tinvest.trade_account_id(),
                 "total": planned,
-                "items": [(it.candidate.name, it.candidate.figi, it.lots, it.cost)
+                # цену лимитной заявки считаем СЕЙЧАС и сохраняем — при нажатии
+                # кнопки покупаем ровно по ней (в пунктах, % номинала).
+                "items": [(it.candidate.name, it.candidate.figi, it.lots, it.cost,
+                           TInvestClient.limit_price_pct(it.candidate,
+                                                         self.cfg.limit_buffer_pct))
                           for it in buyable],
             }
             buttons = [[{"text": f"🛒 Купить · {fmt._num(planned)} ₽",
@@ -217,9 +222,11 @@ class TelegramBot:
         p["status"] = "confirming"
         self.answer_cb(cb_id)
         lines = ["❓ <b>Подтверди покупку</b>\n"]
-        for name, figi, lots, cost in p["items"]:
+        for name, figi, lots, cost, limit_pct in p["items"]:
             lines.append(f"• {fmt.esc(name)} — {lots} лот. ≈ {fmt._num(cost)} ₽")
-        lines.append(f"\nИтого: <b>{fmt._num(p['total'])} ₽</b> рыночными заявками.")
+        lines.append(f"\nИтого: <b>{fmt._num(p['total'])} ₽</b> лимитными заявками "
+                     f"(потолок цены +{fmt._num(Decimal(str(self.cfg.limit_buffer_pct)), 2)}%, "
+                     f"защита от проскальзывания).")
         buttons = [[{"text": "✅ Подтвердить", "callback_data": f"rv|confirm|{pid}"},
                     {"text": "✖ Отмена", "callback_data": f"rv|cancel|{pid}"}]]
         self.send(chat_id, "\n".join(lines), buttons=buttons)
@@ -231,10 +238,11 @@ class TelegramBot:
         p["status"] = "executing"       # блокируем двойной клик
         self.answer_cb(cb_id, "Отправляю заявки…")
         results = []
-        for name, figi, lots, cost in p["items"]:
+        for name, figi, lots, cost, limit_pct in p["items"]:
             order_id = uuid.uuid4().hex
             try:
-                resp = self.tinvest.post_market_buy(p["acc_id"], figi, lots, order_id)
+                resp = self.tinvest.post_limit_buy(p["acc_id"], figi, lots,
+                                                   limit_pct, order_id)
                 results.append((name, lots, resp))
                 _log_order(order_id, name, figi, lots,
                            resp.get("executionReportStatus", "?"))
@@ -304,7 +312,8 @@ class TelegramBot:
             log.info("Автопокупка: биржа закрыта — пропускаю (тихо)")
             return
         items, remaining = TInvestClient.plan_purchase(
-            cands, free, cfg.bond_top_n, cfg.reinvest_max_rub)
+            cands, free, cfg.bond_top_n, cfg.reinvest_max_rub,
+            cfg.bond_max_issuer_pct)
         buyable = [it for it in items if it.lots > 0]
         if not buyable:
             log.info("Автопокупка: %s ₽ есть, но не хватает на целый лот — пропускаю (тихо)", free)
@@ -313,9 +322,11 @@ class TelegramBot:
         results = []
         for it in buyable:
             name, figi, lots = it.candidate.name, it.candidate.figi, it.lots
+            limit_pct = TInvestClient.limit_price_pct(it.candidate, cfg.limit_buffer_pct)
             order_id = uuid.uuid4().hex
             try:
-                resp = self.tinvest.post_market_buy(acc_id, figi, lots, order_id)
+                resp = self.tinvest.post_limit_buy(acc_id, figi, lots,
+                                                   limit_pct, order_id)
                 results.append((name, lots, resp))
                 _log_order(order_id, name, figi, lots,
                            "AUTO:" + str(resp.get("executionReportStatus", "?")))

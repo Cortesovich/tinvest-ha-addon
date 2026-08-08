@@ -59,10 +59,17 @@ class Config:
     reinvest_min_cash: float = 1000.0   # ниже этой суммы свободных рублей — не предлагать
     bond_max_screened: int = 80         # предохранитель по числу расчётов YTM (rate limit)
     bond_whitelist: list = field(default_factory=lambda: list(DEFAULT_BOND_WHITELIST))
+    # P2 — лимит концентрации: не более X% суммы плана в одного КОРПОРАТИВНОГО
+    # эмитента на фазе догрузки (ОФЗ без ограничения). 0 = лимит выключен.
+    bond_max_issuer_pct: float = 40.0
 
     # --- покупка по кнопке (Этап C) ---
     trade_enabled: bool = False         # ГЛАВНЫЙ выключатель покупок. False = кнопки нет
     reinvest_max_rub: float = 0.0       # лимит суммы на одну операцию, ₽ (0 = без доп. лимита)
+    # P1 — лимитные заявки: цена = последняя цена + буфер (%). Буфер даёт запас,
+    # чтобы заявка исполнилась, и одновременно задаёт ПОТОЛОК проскальзывания
+    # (у рыночной заявки его нет). 0 = ставить ровно по последней цене.
+    limit_buffer_pct: float = 0.5
 
     # --- топ-листы и отбор акций ---
     topbonds_n: int = 5                 # сколько облигаций показывать в /topbonds
@@ -128,8 +135,10 @@ def load_config() -> Config:
         bond_max_screened=int(params.get("bond_max_screened", 80)),
         bond_whitelist=[str(x).lower() for x in
                         (params.get("bond_whitelist") or DEFAULT_BOND_WHITELIST)],
+        bond_max_issuer_pct=float(params.get("bond_max_issuer_pct", 40)),
         trade_enabled=bool(params.get("trade_enabled", False)),
         reinvest_max_rub=float(params.get("reinvest_max_rub", 0)),
+        limit_buffer_pct=float(params.get("limit_buffer_pct", 0.5)),
         topbonds_n=int(params.get("topbonds_n", 5)),
         stock_top_n=int(params.get("stock_top_n", 10)),
         stock_min_market_cap=float(params.get("stock_min_market_cap", 0)),

@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 
 import requests
 
@@ -62,6 +62,18 @@ def _money(v) -> Decimal:
     units = int(v.get("units", 0) or 0)
     nano = int(v.get("nano", 0) or 0)
     return Decimal(units) + Decimal(nano) / Decimal(1_000_000_000)
+
+
+def _to_quotation(value: Decimal) -> dict:
+    """Decimal -> Quotation {units, nano}. Обратное к _money.
+
+    units отправляем строкой (int64 в JSON REST), nano — целое (int32).
+    Для положительных цен units — целая часть, nano — дробная × 1e9.
+    """
+    q = value.quantize(Decimal("0.000000001"))   # не больше 9 знаков (nano)
+    units = int(q)                                # усечение к нулю (цены > 0)
+    nano = int((q - units) * Decimal(1_000_000_000))
+    return {"units": str(units), "nano": nano}
 
 
 def _ccy(v) -> str:
@@ -156,6 +168,12 @@ class BondCandidate:
     days_left: int
     is_ofz: bool
     lot: int = 1              # бумаг в одном лоте (у облигаций обычно 1)
+    # шаг цены в ПУНКТАХ (% номинала); нужен, чтобы округлить цену лимитной
+    # заявки до допустимого тика (иначе биржа отклонит заявку).
+    min_price_increment: Decimal = Decimal("0.01")
+    # ключ эмитента для контроля концентрации (P2): ОФЗ → "ОФЗ" (государство),
+    # корпораты → совпавший фрагмент из whitelist. Пусто = не сгруппирован.
+    issuer: str = ""
 
 
 @dataclass
@@ -524,12 +542,16 @@ class TInvestClient:
             cqy = b.get("couponQuantityPerYear") or 0
             coupon_annual = (float(next_coupon) * float(cqy) / float(nominal) * 100
                              if next_coupon and nominal and cqy else None)
+            incr = _money(b.get("minPriceIncrement"))
+            if incr <= 0:
+                incr = Decimal("0.01")   # разумный шаг по умолчанию, если API не отдал
             out.append(BondCandidate(
                 name=b.get("name", figi), ticker=b.get("ticker", ""), figi=figi,
                 price_pct=price_pct, dirty_price=dirty, nominal=nominal,
                 ytm_pct=ytm * 100, coupon_annual_pct=coupon_annual,
                 maturity=mat, days_left=(mat - now).days, is_ofz=_is_ofz(b),
                 lot=int(b.get("lot") or 1),
+                min_price_increment=incr, issuer=_issuer_key(b, wl),
             ))
         out.sort(key=lambda c: c.ytm_pct, reverse=True)
         if truncated:
@@ -548,27 +570,52 @@ class TInvestClient:
     # --- план покупки (жадное распределение по лотам) ---
     @staticmethod
     def plan_purchase(candidates: list[BondCandidate], free_cash: Decimal,
-                      top_n: int, max_rub: float = 0.0) -> tuple[list[PlanItem], Decimal]:
+                      top_n: int, max_rub: float = 0.0,
+                      max_issuer_pct: float = 0.0) -> tuple[list[PlanItem], Decimal]:
+        """План покупки: сначала по 1 лоту каждого топ-кандидата (диверсификация),
+        затем догрузка самой доходной из доступных.
+
+        P2 — лимит концентрации: max_issuer_pct (>0) ограничивает долю ОДНОГО
+        корпоративного эмитента в фазе догрузки (не более X% суммы плана). ОФЗ
+        не ограничиваем — это госбумаги (эталон надёжности). Фаза «по 1 лоту»
+        лимит игнорирует, чтобы малый бюджет всё же взял топ-бумагу.
+        """
         top = candidates[:top_n]
         budget = free_cash
         if max_rub and max_rub > 0:
             budget = min(budget, Decimal(str(max_rub)))
         lots = {c.figi: 0 for c in top}
         unit = {c.figi: (c.dirty_price * c.lot) for c in top}  # цена одного лота
+        cap = (budget * Decimal(str(max_issuer_pct)) / Decimal(100)
+               if max_issuer_pct and max_issuer_pct > 0 else None)
+        by_issuer: dict[str, Decimal] = {}   # потрачено на эмитента (для лимита)
+
+        def _issuer(c: BondCandidate) -> str:
+            return c.issuer or c.figi
+
         left = budget
         for c in top:                       # по 1 лоту каждой (диверсификация)
             if unit[c.figi] > 0 and left >= unit[c.figi]:
                 lots[c.figi] += 1
                 left -= unit[c.figi]
+                by_issuer[_issuer(c)] = by_issuer.get(_issuer(c), Decimal(0)) + unit[c.figi]
         filling = True
         while filling:                      # добираем самую доходную из доступных
             filling = False
             for c in top:
-                if unit[c.figi] > 0 and left >= unit[c.figi]:
-                    lots[c.figi] += 1
-                    left -= unit[c.figi]
-                    filling = True
-                    break
+                u = unit[c.figi]
+                if u <= 0 or left < u:
+                    continue
+                iss = _issuer(c)
+                # лимит концентрации: только для корпоратов, ОФЗ без ограничения
+                if cap is not None and not c.is_ofz \
+                        and by_issuer.get(iss, Decimal(0)) + u > cap:
+                    continue
+                lots[c.figi] += 1
+                left -= u
+                by_issuer[iss] = by_issuer.get(iss, Decimal(0)) + u
+                filling = True
+                break
         items, spent = [], Decimal(0)
         for c in top:                        # включаем все top (в т.ч. с 0 лотов)
             cost = lots[c.figi] * unit[c.figi]
@@ -576,7 +623,8 @@ class TInvestClient:
             spent += cost
         return items, free_cash - spent
 
-    # --- выставление рыночной заявки на покупку (Этап C) ---
+    # --- выставление рыночной заявки на покупку (оставлено как ручной запасной
+    #     вариант; штатно бот покупает лимитной заявкой, см. post_limit_buy) ---
     def post_market_buy(self, account_id: str, figi: str, lots: int,
                         order_id: str) -> dict:
         """Рыночная заявка на покупку. Требует full-access токен."""
@@ -586,6 +634,38 @@ class TInvestClient:
             "quantity": str(lots),
             "direction": "ORDER_DIRECTION_BUY",
             "orderType": "ORDER_TYPE_MARKET",
+            "orderId": order_id,
+        }, trade=True)
+
+    # --- лимитная заявка на покупку (P1 — защита от проскальзывания) ---
+    @staticmethod
+    def limit_price_pct(cand: BondCandidate, buffer_pct: float) -> Decimal:
+        """Цена лимитной заявки В ПУНКТАХ (% номинала): последняя цена + буфер,
+        округлённая ВВЕРХ до шага цены. Округление вверх делает заявку
+        исполнимой (не встаёт ниже рынка), а буфер задаёт максимум переплаты —
+        это и есть потолок проскальзывания вместо неограниченного у рыночной.
+        """
+        incr = cand.min_price_increment if cand.min_price_increment > 0 else Decimal("0.01")
+        raw = cand.price_pct * (Decimal(1) + Decimal(str(buffer_pct)) / Decimal(100))
+        steps = (raw / incr).to_integral_value(rounding=ROUND_CEILING)
+        return steps * incr
+
+    def post_limit_buy(self, account_id: str, figi: str, lots: int,
+                       price_pct: Decimal, order_id: str) -> dict:
+        """Лимитная заявка на покупку облигации. Требует full-access токен.
+
+        price_pct — цена ОДНОЙ бумаги в пунктах (% номинала). Явно передаём
+        priceType=PRICE_TYPE_POINT, чтобы API трактовал цену как проценты
+        номинала (та же единица, что у котировок), а не как рубли.
+        """
+        return self._call("OrdersService", "PostOrder", {
+            "accountId": account_id,
+            "instrumentId": figi,
+            "quantity": str(lots),
+            "direction": "ORDER_DIRECTION_BUY",
+            "orderType": "ORDER_TYPE_LIMIT",
+            "price": _to_quotation(price_pct),
+            "priceType": "PRICE_TYPE_POINT",
             "orderId": order_id,
         }, trade=True)
 
@@ -689,6 +769,23 @@ def _is_ofz(bond: dict) -> bool:
     name = (bond.get("name") or "").lower()
     ticker = (bond.get("ticker") or "").upper()
     return name.startswith("офз") or ticker.startswith("SU")
+
+
+def _issuer_key(bond: dict, whitelist: list[str]) -> str:
+    """Ключ эмитента для контроля концентрации (P2).
+
+    ОФЗ — один эмитент (государство). Корпораты — по совпавшему фрагменту из
+    whitelist (магнит/ржд/сбер…); если не нашли — первое слово названия.
+    whitelist уже в нижнем регистре (как в get_reinvest_candidates).
+    """
+    if _is_ofz(bond):
+        return "ОФЗ"
+    name = (bond.get("name") or "").lower()
+    for frag in whitelist:
+        if frag and frag in name:
+            return frag
+    parts = name.split()
+    return parts[0] if parts else "?"
 
 
 def _bond_reliable(bond: dict, whitelist: list[str]) -> bool:
