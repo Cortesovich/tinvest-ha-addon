@@ -145,9 +145,11 @@ class TelegramBot:
             self.cfg.bond_whitelist, self.cfg.bond_max_screened)
         free = self.tinvest.get_balance().money
         market_open = self.tinvest.market_is_open(cands[0].figi) if cands else None
+        held_by_issuer, existing_total = self.tinvest.bond_holdings_by_issuer(
+            self.cfg.bond_whitelist)
         items, remaining = TInvestClient.plan_purchase(
             cands, free, self.cfg.bond_top_n, self.cfg.reinvest_max_rub,
-            self.cfg.bond_max_issuer_pct)
+            self.cfg.bond_max_issuer_pct, held_by_issuer, existing_total)
 
         planned = free - remaining
         buyable = [it for it in items if it.lots > 0]
@@ -311,9 +313,11 @@ class TelegramBot:
         if self.tinvest.market_is_open(cands[0].figi) is not True:
             log.info("Автопокупка: биржа закрыта — пропускаю (тихо)")
             return
+        held_by_issuer, existing_total = self.tinvest.bond_holdings_by_issuer(
+            cfg.bond_whitelist)
         items, remaining = TInvestClient.plan_purchase(
             cands, free, cfg.bond_top_n, cfg.reinvest_max_rub,
-            cfg.bond_max_issuer_pct)
+            cfg.bond_max_issuer_pct, held_by_issuer, existing_total)
         buyable = [it for it in items if it.lots > 0]
         if not buyable:
             log.info("Автопокупка: %s ₽ есть, но не хватает на целый лот — пропускаю (тихо)", free)

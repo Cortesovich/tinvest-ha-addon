@@ -55,13 +55,14 @@ class Config:
     # --- отбор облигаций для реинвеста (Этап 3) ---
     bond_min_maturity_days: int = 183   # не покупать бумаги, гасящиеся раньше ~6 мес
     bond_max_maturity_days: int = 1825  # максимум 5 лет до погашения
-    bond_top_n: int = 3                 # сколько кандидатов предлагать
+    bond_top_n: int = 10                # кандидатов в плане покупки (больше = шире диверсификация)
     reinvest_min_cash: float = 1000.0   # ниже этой суммы свободных рублей — не предлагать
     bond_max_screened: int = 80         # предохранитель по числу расчётов YTM (rate limit)
     bond_whitelist: list = field(default_factory=lambda: list(DEFAULT_BOND_WHITELIST))
-    # P2 — лимит концентрации: не более X% суммы плана в одного КОРПОРАТИВНОГО
-    # эмитента на фазе догрузки (ОФЗ без ограничения). 0 = лимит выключен.
-    bond_max_issuer_pct: float = 40.0
+    # P2 — ПОРТФЕЛЬНЫЙ лимит концентрации: по одной КОМПАНИИ (корп. эмитенту)
+    # не более X% облигационной части (с учётом уже купленного). ОФЗ без лимита.
+    # 0 = выключен.
+    bond_max_issuer_pct: float = 20.0
 
     # --- покупка по кнопке (Этап C) ---
     trade_enabled: bool = False         # ГЛАВНЫЙ выключатель покупок. False = кнопки нет
@@ -130,12 +131,12 @@ def load_config() -> Config:
         poll_timeout=int(params.get("poll_timeout", 30)),
         bond_min_maturity_days=int(params.get("bond_min_maturity_days", 183)),
         bond_max_maturity_days=int(params.get("bond_max_maturity_days", 1825)),
-        bond_top_n=int(params.get("bond_top_n", 3)),
+        bond_top_n=int(params.get("bond_top_n", 10)),
         reinvest_min_cash=float(params.get("reinvest_min_cash", 1000)),
         bond_max_screened=int(params.get("bond_max_screened", 80)),
         bond_whitelist=[str(x).lower() for x in
                         (params.get("bond_whitelist") or DEFAULT_BOND_WHITELIST)],
-        bond_max_issuer_pct=float(params.get("bond_max_issuer_pct", 40)),
+        bond_max_issuer_pct=float(params.get("bond_max_issuer_pct", 20)),
         trade_enabled=bool(params.get("trade_enabled", False)),
         reinvest_max_rub=float(params.get("reinvest_max_rub", 0)),
         limit_buffer_pct=float(params.get("limit_buffer_pct", 0.5)),

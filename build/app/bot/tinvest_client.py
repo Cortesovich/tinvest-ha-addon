@@ -567,18 +567,63 @@ class TInvestClient:
             return None
         return d.get("tradingStatus") == "SECURITY_TRADING_STATUS_NORMAL_TRADING"
 
+    # --- текущие облигации по эмитентам (для портфельного лимита концентрации) ---
+    def bond_holdings_by_issuer(self, whitelist: list[str]
+                                ) -> tuple[dict[str, Decimal], Decimal]:
+        """Стоимость уже купленных облигаций по эмитентам (рубли) + общая сумма.
+
+        Эмитент определяется как в whitelist (ОФЗ → "ОФЗ"). Стоимость бумаги =
+        кол-во × (цена%/100 × номинал + НКД). Цена — последняя (в % номинала);
+        если её нет — берём номинал (100%). Нужен для лимита «≤X% на компанию».
+        """
+        wl = [w.lower() for w in whitelist]
+        acc_id, _ = self.resolve_account()
+        positions = self._bond_positions(acc_id)
+        figis = [p.get("figi") for p in positions if p.get("figi")]
+        prices = self._last_prices(figis) if figis else {}
+        by_issuer: dict[str, Decimal] = {}
+        total = Decimal(0)
+        for pos in positions:
+            figi = pos.get("figi")
+            qty = _money(pos.get("quantity"))
+            if not figi or qty <= 0:
+                continue
+            try:
+                bond = self._bond_info(figi)
+            except TInvestError as e:
+                log.warning("Эмитент по %s недоступен: %s", figi, e)
+                continue
+            nominal = _money(bond.get("nominal"))
+            aci = _money(bond.get("aciValue"))
+            price_pct = prices.get(figi) or Decimal(100)
+            value = qty * (price_pct / Decimal(100) * nominal + aci)
+            if value <= 0:
+                continue
+            iss = _issuer_key(bond, wl)
+            by_issuer[iss] = by_issuer.get(iss, Decimal(0)) + value
+            total += value
+        return by_issuer, total
+
     # --- план покупки (жадное распределение по лотам) ---
     @staticmethod
     def plan_purchase(candidates: list[BondCandidate], free_cash: Decimal,
                       top_n: int, max_rub: float = 0.0,
-                      max_issuer_pct: float = 0.0) -> tuple[list[PlanItem], Decimal]:
-        """План покупки: сначала по 1 лоту каждого топ-кандидата (диверсификация),
-        затем догрузка самой доходной из доступных.
+                      max_issuer_pct: float = 0.0,
+                      held_by_issuer: dict | None = None,
+                      existing_bond_total: Decimal = Decimal(0)
+                      ) -> tuple[list[PlanItem], Decimal]:
+        """План покупки: по 1 лоту каждого топ-кандидата (диверсификация), затем
+        догрузка самой доходной из доступных.
 
-        P2 — лимит концентрации: max_issuer_pct (>0) ограничивает долю ОДНОГО
-        корпоративного эмитента в фазе догрузки (не более X% суммы плана). ОФЗ
-        не ограничиваем — это госбумаги (эталон надёжности). Фаза «по 1 лоту»
-        лимит игнорирует, чтобы малый бюджет всё же взял топ-бумагу.
+        P2 — ПОРТФЕЛЬНЫЙ лимит концентрации (max_issuer_pct > 0): по одной
+        КОМПАНИИ (корп. эмитенту) держим не более X% облигационной части, УЧИТЫВАЯ
+        уже купленное. held_by_issuer = {эмитент: руб уже в портфеле},
+        existing_bond_total = стоимость всех облигаций сейчас. Правила:
+          • эмитента, чья доля уже ≥ X% текущих облигаций, НЕ докупаем вовсе;
+          • остальных докупаем, пока (уже + новое) ≤ X% от (текущие + бюджет);
+          • ОФЗ (госбумаги, не компания) — без лимита.
+        Если held/total не переданы (=0) — вырождается в лимит в пределах бюджета.
+        Лимит действует в ОБЕИХ фазах (диверсификация и догрузка).
         """
         top = candidates[:top_n]
         budget = free_cash
@@ -586,34 +631,46 @@ class TInvestClient:
             budget = min(budget, Decimal(str(max_rub)))
         lots = {c.figi: 0 for c in top}
         unit = {c.figi: (c.dirty_price * c.lot) for c in top}  # цена одного лота
-        cap = (budget * Decimal(str(max_issuer_pct)) / Decimal(100)
+        held = dict(held_by_issuer or {})
+        existing_total = existing_bond_total or Decimal(0)
+        pct = (Decimal(str(max_issuer_pct))
                if max_issuer_pct and max_issuer_pct > 0 else None)
-        by_issuer: dict[str, Decimal] = {}   # потрачено на эмитента (для лимита)
+        # знаменатель лимита — проектная стоимость облигаций (текущие + бюджет)
+        cap_rub = ((existing_total + budget) * pct / Decimal(100)
+                   if pct is not None else None)
+        new_by_issuer: dict[str, Decimal] = {}   # запланировано к покупке по эмитенту
 
         def _issuer(c: BondCandidate) -> str:
             return c.issuer or c.figi
 
+        def _allowed(c: BondCandidate) -> bool:
+            if cap_rub is None or c.is_ofz:        # без лимита / ОФЗ — всегда можно
+                return True
+            iss = _issuer(c)
+            h = held.get(iss, Decimal(0))
+            # доля эмитента УЖЕ достигла порога от текущих облигаций — не докупаем
+            if existing_total > 0 and h > 0 and h >= pct / Decimal(100) * existing_total:
+                return False
+            # (уже + запланировано + этот лот) в пределах X% от (текущие + бюджет)
+            return h + new_by_issuer.get(iss, Decimal(0)) + unit[c.figi] <= cap_rub
+
         left = budget
         for c in top:                       # по 1 лоту каждой (диверсификация)
-            if unit[c.figi] > 0 and left >= unit[c.figi]:
+            u = unit[c.figi]
+            if u > 0 and left >= u and _allowed(c):
                 lots[c.figi] += 1
-                left -= unit[c.figi]
-                by_issuer[_issuer(c)] = by_issuer.get(_issuer(c), Decimal(0)) + unit[c.figi]
+                left -= u
+                new_by_issuer[_issuer(c)] = new_by_issuer.get(_issuer(c), Decimal(0)) + u
         filling = True
         while filling:                      # добираем самую доходную из доступных
             filling = False
             for c in top:
                 u = unit[c.figi]
-                if u <= 0 or left < u:
-                    continue
-                iss = _issuer(c)
-                # лимит концентрации: только для корпоратов, ОФЗ без ограничения
-                if cap is not None and not c.is_ofz \
-                        and by_issuer.get(iss, Decimal(0)) + u > cap:
+                if u <= 0 or left < u or not _allowed(c):
                     continue
                 lots[c.figi] += 1
                 left -= u
-                by_issuer[iss] = by_issuer.get(iss, Decimal(0)) + u
+                new_by_issuer[_issuer(c)] = new_by_issuer.get(_issuer(c), Decimal(0)) + u
                 filling = True
                 break
         items, spent = [], Decimal(0)
