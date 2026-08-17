@@ -92,6 +92,12 @@ class TelegramBot:
             elif cmd == "maturity":
                 items = self.tinvest.get_maturities()
                 self.send(chat_id, fmt.format_maturities(items, self.cfg.timezone))
+            elif cmd == "holdings":
+                self.send(chat_id, "Считаю доли по компаниям…")
+                by_issuer, total = self.tinvest.bond_holdings_by_issuer(
+                    self.cfg.bond_whitelist)
+                self.send(chat_id, fmt.format_holdings(
+                    by_issuer, total, self.cfg.bond_max_issuer_pct))
             elif cmd == "topbonds":
                 self.send(chat_id, "Считаю доходности облигаций…")
                 cands = self.tinvest.get_reinvest_candidates(

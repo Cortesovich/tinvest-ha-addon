@@ -59,18 +59,39 @@ def format_balance(b: Balance) -> str:
     )
 
 
+_MONTHS_RU = ["", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+
+
 def format_coupons(items: list[CouponItem], tz: str, days: int) -> str:
     if not items:
         return f"Купонных выплат в ближайшие {days} дн. не найдено."
-    lines = [f"🎟 <b>Ближайшие купоны ({days} дн.)</b>\n"]
+    lines = [f"🎟 <b>Ближайшие купоны ({days} дн.)</b>"]
     total_by_ccy: dict[str, Decimal] = {}
+    cur_key = None                      # (год, месяц) текущей группы
+    month_by_ccy: dict[str, Decimal] = {}
+
+    def _month_subtotal():
+        if month_by_ccy:
+            s = ", ".join(f"{_num(v)} {esc(k)}" for k, v in month_by_ccy.items())
+            lines.append(f"    <i>за месяц: {s}</i>")
+
     for c in items:
+        d = c.date.astimezone(_zone(tz))
+        key = (d.year, d.month)
+        if key != cur_key:
+            _month_subtotal()           # подытог за предыдущий месяц
+            cur_key = key
+            month_by_ccy = {}
+            lines.append(f"\n<b>── {_MONTHS_RU[d.month]} {d.year} ──</b>")
         lines.append(
             f"{_dt(c.date, tz)} — {esc(c.bond_name)}\n"
             f"    {_num(c.total)} {esc(c.currency)} "
             f"({_num(c.per_bond)} × {_num(c.quantity, 0)})"
         )
         total_by_ccy[c.currency] = total_by_ccy.get(c.currency, Decimal(0)) + c.total
+        month_by_ccy[c.currency] = month_by_ccy.get(c.currency, Decimal(0)) + c.total
+    _month_subtotal()                   # подытог за последний месяц
     summary = ", ".join(f"{_num(v)} {esc(k)}" for k, v in total_by_ccy.items())
     lines.append(f"\nИтого к выплате: <b>{summary}</b>")
     return "\n".join(lines)
@@ -86,6 +107,43 @@ def format_maturities(items: list[MaturityItem], tz: str) -> str:
             f"{_dt(m.maturity, tz)} (через {left}) — {esc(m.bond_name)}\n"
             f"    {_num(m.quantity, 0)} шт. × номинал {_num(m.nominal)} {esc(m.currency)}"
         )
+    return "\n".join(lines)
+
+
+# Красивые имена эмитентов для вывода (ключ концентрации — в нижнем регистре).
+_ISSUER_DISPLAY = {
+    "офз": "ОФЗ", "ржд": "РЖД", "втб": "ВТБ", "рсхб": "РСХБ", "вэб": "ВЭБ",
+    "мтс": "МТС", "гмк": "ГМК", "фск": "ФСК", "x5": "X5", "икс 5": "Икс 5",
+    "дом.рф": "ДОМ.РФ", "дом рф": "ДОМ РФ",
+}
+
+
+def _issuer_display(key: str) -> str:
+    k = (key or "").lower()
+    if k in _ISSUER_DISPLAY:
+        return _ISSUER_DISPLAY[k]
+    return key[:1].upper() + key[1:] if key else key
+
+
+def format_holdings(by_issuer: dict, total: Decimal, cap_pct: float) -> str:
+    """Купленные облигации по компаниям: доля от облигационной части, по убыванию."""
+    if not by_issuer or total <= 0:
+        return "Облигаций на счёте не найдено."
+    rows = sorted(by_issuer.items(), key=lambda kv: kv[1], reverse=True)
+    cap = Decimal(str(cap_pct)) if cap_pct and cap_pct > 0 else None
+    lines = ["🏦 <b>Облигации по компаниям</b>",
+             f"Всего облигаций: {_num(total)} ₽\n"]
+    for iss, val in rows:
+        share = (val / total * Decimal(100)) if total > 0 else Decimal(0)
+        over = cap is not None and iss != "ОФЗ" and share >= cap
+        name = _issuer_display(iss)
+        name = f"<b>{esc(name)}</b>" if over else esc(name)
+        lines.append(f"{name} — {share:.1f}% · {_num(val)} ₽{' ⚠️' if over else ''}")
+    note = "<i>Доля от облигационной части."
+    if cap is not None:
+        note += f" ⚠️ = достигнут лимит {_num(cap, 0)}% на компанию (ОФЗ без лимита)."
+    note += "</i>"
+    lines.append("\n" + note)
     return "\n".join(lines)
 
 
@@ -245,6 +303,7 @@ HELP_TEXT = (
     "/income — годовая доходность (XIRR) и прибыль\n"
     "/coupons — ближайшие купонные выплаты\n"
     "/maturity — сроки погашения облигаций\n"
+    "/holdings — облигации по компаниям (доля, лимит 20%)\n"
     "/topbonds — топ-5 облигаций по YTM (без покупки)\n"
     "/topstocks — топ-10 акций по скору (без покупки)\n"
     "/reinvest — подбор покупки облигаций с учётом баланса\n"
