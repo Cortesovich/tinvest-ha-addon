@@ -787,6 +787,87 @@ class TInvestClient:
         acc_id, acc_name = self.resolve_account()
         return f"OK: счёт '{acc_name}' (id={acc_id})"
 
+    # ============ READ-ONLY снимки для экспортёра Mini App/скоринга ============
+    # Все методы ниже — ТОЛЬКО ЧТЕНИЕ (trade=False). Ни заявок, ни покупок.
+    # Пригодны для токена без торговых прав.
+
+    def portfolio_raw(self) -> dict:
+        """Сырой GetPortfolio по выбранному счёту (для снимка портфеля)."""
+        acc_id, _ = self.resolve_account()
+        return self._call("OperationsService", "GetPortfolio",
+                          {"accountId": acc_id, "currency": "RUB"})
+
+    def instrument_brief(self, figi: str) -> dict:
+        """Имя/тикер/ISIN инструмента по FIGI (универсально, read-only)."""
+        data = self._call("InstrumentsService", "GetInstrumentBy",
+                          {"idType": "INSTRUMENT_ID_TYPE_FIGI", "id": figi})
+        return data.get("instrument", {})
+
+    def iis_universe_rows(self) -> list[dict]:
+        """Текущий снимок ИИС-доступности: облигации+акции с флагами API.
+
+        Только инструменты с forIisFlag=true. В строку кладём ЛИШЬ реально
+        отданные API флаги; отсутствующий флаг = None (в CSV станет пустым).
+        """
+        rows: list[dict] = []
+        for kind, items in (("bond", self._all_bonds()),
+                            ("share", self._all_shares())):
+            for it in items:
+                if not it.get("forIisFlag"):
+                    continue  # снимок ограничен ИИС-доступными инструментами
+                rows.append({
+                    "secid": it.get("ticker") or "",
+                    "isin": it.get("isin") or "",
+                    "figi": it.get("figi") or "",
+                    "instrument_type": kind,
+                    "currency": (it.get("currency") or "").lower(),
+                    "api_trade_available": it.get("apiTradeAvailableFlag"),
+                    "buy_available": it.get("buyAvailableFlag"),
+                    "sell_available": it.get("sellAvailableFlag"),
+                })
+        return rows
+
+    def raw_fundamentals(self, whitelist_tickers: list[str]) -> list[dict]:
+        """Сырые скалярные поля GetAssetFundamentals по тикерам (диагностика).
+
+        Значения «как есть», без расчётов. unit/period API не сообщает — их
+        заполняет вызывающий пустыми. null и вложенные структуры не выводим.
+        """
+        wl = {t.upper() for t in whitelist_tickers}
+        picked = [s for s in self._all_shares()
+                  if (s.get("ticker") or "").upper() in wl
+                  and (s.get("currency") or "").lower() == "rub"]
+
+        def auid(s):
+            return s.get("assetUid") or s.get("uid")
+
+        by_asset = {auid(s): s for s in picked if auid(s)}
+        ids = [a for a in by_asset if a]
+        funds: dict[str, dict] = {}
+        for i in range(0, len(ids), 90):
+            try:
+                resp = self._call("InstrumentsService", "GetAssetFundamentals",
+                                  {"assets": ids[i:i + 90]})
+            except TInvestError as e:
+                log.warning("GetAssetFundamentals недоступен: %s", e)
+                continue
+            for f in resp.get("fundamentals", []):
+                funds[f.get("assetUid")] = f
+
+        rows: list[dict] = []
+        for asset_uid, f in funds.items():
+            s = by_asset.get(asset_uid, {})
+            secid = (s.get("ticker") or "").upper()
+            isin = s.get("isin") or ""
+            for key, val in f.items():
+                if key in ("assetUid", "currency"):
+                    continue
+                if val is None or isinstance(val, (dict, list)):
+                    continue  # только скалярные поля, null не выдумываем
+                rows.append({"secid": secid, "isin": isin,
+                             "api_field": key, "api_value": val})
+        return rows
+
 
 def _err_text(r: requests.Response) -> str:
     try:

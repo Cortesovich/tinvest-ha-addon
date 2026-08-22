@@ -297,6 +297,18 @@ def format_deposits(items, tz: str) -> str:
     return "\n".join(lines)
 
 
+def format_export_summary(res) -> str:
+    """Обезличенная сводка экспорта: счётчики, статусы, пути. Без позиций/сумм."""
+    icon = {"ok": "✅", "error": "⚠️"}
+    lines = ["📤 <b>Экспорт read-only снимков</b>\n"]
+    for a in res.artifacts:
+        tail = f", строк {a.rows}" if a.status == "ok" else f" — {esc(a.error)}"
+        lines.append(f"{icon.get(a.status, '•')} {esc(a.name)}: {a.status}{tail}")
+    lines.append(f"\nПапка: <code>{esc(res.dir)}</code>")
+    lines.append("Свежесть — в <code>export_status.json</code>.")
+    return "\n".join(lines)
+
+
 HELP_TEXT = (
     "🤖 <b>ИИС-бот (только чтение)</b>\n\n"
     "/balance — баланс и структура счёта\n"
@@ -309,5 +321,6 @@ HELP_TEXT = (
     "/reinvest — подбор покупки облигаций с учётом баланса\n"
     "/deposits — история пополнений\n"
     "/accounts — список доступных счетов\n"
+    "/export — read-only снимки для Mini App (владелец)\n"
     "/help — эта справка"
 )

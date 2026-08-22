@@ -94,6 +94,10 @@ class Config:
     autobuy_days: list = field(default_factory=lambda: ["mon", "fri"])  # дни недели
     autobuy_time: str = "11:00"          # время запуска в часовом поясе timezone (ЧЧ:ММ)
 
+    # --- read-only экспорт снимков для Mini App/скоринга (интеграция) ---
+    export_dir: str = ""                          # пусто = DATA_DIR/export
+    export_fundamentals_scope: str = "whitelist"  # whitelist | none
+
 
 def _require(name: str) -> str:
     val = os.getenv(name, "").strip()
@@ -158,4 +162,7 @@ def load_config() -> Config:
         autobuy_days=[str(x).strip().lower() for x in
                       (params.get("autobuy_days") or ["mon", "fri"])],
         autobuy_time=str(params.get("autobuy_time", "11:00")),
+        export_dir=str(params.get("export_dir", "") or ""),
+        export_fundamentals_scope=str(
+            params.get("export_fundamentals_scope", "whitelist")),
     )

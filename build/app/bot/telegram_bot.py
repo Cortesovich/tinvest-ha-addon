@@ -14,6 +14,7 @@ from decimal import Decimal
 import requests
 
 from . import formatters as fmt
+from . import snapshot_export
 from . import stocks
 from .config import Config, DATA_DIR
 from .tinvest_client import TInvestClient
@@ -117,6 +118,12 @@ class TelegramBot:
             elif cmd == "accounts":
                 accs = self.tinvest.list_accounts()
                 self.send(chat_id, "Счета:\n" + "\n".join(fmt.esc(a) for a in accs))
+            elif cmd == "export":
+                if is_owner:
+                    self._cmd_export(chat_id)
+                else:
+                    self.send(chat_id, "Экспорт read-only снимков доступен только "
+                                       "владельцу счёта.")
             else:
                 self.send(chat_id, "Неизвестная команда. /help")
         except Exception as e:  # noqa: BLE001
@@ -143,6 +150,18 @@ class TelegramBot:
             self.cfg.stock_min_pe)
         stocks.write_scores_csv(scored)
         self.send(chat_id, fmt.format_topstocks(scored, self.cfg.stock_top_n, bond_ytm))
+
+    def _cmd_export(self, chat_id: int):
+        """Read-only выгрузка трёх снимков (владелец). Ничего не покупает."""
+        self.send(chat_id, "Собираю read-only снимки…")
+        res = snapshot_export.run_export(
+            self.tinvest,
+            export_dir=self.cfg.export_dir or None,
+            coupon_lookahead_days=self.cfg.coupon_lookahead_days,
+            fundamentals_scope=self.cfg.export_fundamentals_scope,
+            stock_whitelist=self.cfg.stock_whitelist,
+        )
+        self.send(chat_id, fmt.format_export_summary(res))
 
     def _cmd_reinvest(self, chat_id: int):
         self.send(chat_id, "Подбираю облигации, это займёт до минуты…")
