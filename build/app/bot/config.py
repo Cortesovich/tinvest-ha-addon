@@ -41,6 +41,7 @@ class Config:
     tinvest_token: str
     telegram_token: str
     trade_token: str = ""              # full-access токен для покупок (TINVEST_TRADE_TOKEN); пусто = использовать основной
+    export_push_secret: str = ""       # сервисный ключ приёмника Mini App (.env EXPORT_PUSH_SECRET; не в коде/логах)
     allowed_chat_ids: list[int] = field(default_factory=list)
 
     # --- параметры (config.yaml) ---
@@ -98,6 +99,11 @@ class Config:
     export_dir: str = ""                          # пусто = DATA_DIR/export
     export_fundamentals_scope: str = "whitelist"  # whitelist | none
 
+    # --- автообновление снимка портфеля в Mini App (исходящий push) ---
+    export_push_enabled: bool = False             # главный выключатель push
+    export_push_url: str = ""                     # ingest-эндпоинт Worker'а Codex
+    export_push_time: str = "19:00"               # ежедневный push (в timezone, ЧЧ:ММ)
+
 
 def _require(name: str) -> str:
     val = os.getenv(name, "").strip()
@@ -125,6 +131,7 @@ def load_config() -> Config:
         tinvest_token=_require("TINVEST_TOKEN"),
         telegram_token=_require("TELEGRAM_TOKEN"),
         trade_token=os.getenv("TINVEST_TRADE_TOKEN", "").strip(),
+        export_push_secret=os.getenv("EXPORT_PUSH_SECRET", "").strip(),
         allowed_chat_ids=allowed,
         account_type=str(params.get("account_type", "iis")),
         coupon_lookahead_days=int(params.get("coupon_lookahead_days", 180)),
@@ -165,4 +172,7 @@ def load_config() -> Config:
         export_dir=str(params.get("export_dir", "") or ""),
         export_fundamentals_scope=str(
             params.get("export_fundamentals_scope", "whitelist")),
+        export_push_enabled=bool(params.get("export_push_enabled", False)),
+        export_push_url=str(params.get("export_push_url", "") or ""),
+        export_push_time=str(params.get("export_push_time", "19:00")),
     )

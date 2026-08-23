@@ -10,7 +10,9 @@ not_connected по каждому артефакту).
 
 ГРАНИЦЫ. Модуль ТОЛЬКО ЧИТАЕТ. Он не импортирует и не вызывает торговых методов
 (PostOrder / post_market_buy / post_limit_buy), плана покупки и автопокупки.
-Пригоден для токена без торговых прав. Транспорт наружу здесь НЕ реализован.
+Пригоден для токена без торговых прав. Здесь же — исходящий push снимка
+портфеля в приёмник Mini App (push_snapshot): с нашей стороны это тоже только
+чтение T-Invest + отправка обезличенного снимка (никаких торговых вызовов).
 """
 from __future__ import annotations
 
@@ -20,10 +22,13 @@ import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+
+import requests
 
 from .config import DATA_DIR
 from .tinvest_client import TInvestClient, TInvestError, _money, _ccy, _iso
@@ -274,15 +279,7 @@ def run_export(client: TInvestClient, *, export_dir: str | None = None,
     results: list[ArtifactResult] = []
 
     # запрещённые к выводу идентификаторы (резолвим счёт, но НЕ публикуем).
-    # acc_id скрубим всегда; имя — только если оно НЕ родовой ярлык типа счёта.
-    forbidden: list[str] = []
-    try:
-        acc_id, acc_name = client.resolve_account()
-        forbidden = [acc_id]
-        if acc_name and acc_name not in _GENERIC_ACCOUNT_NAMES:
-            forbidden.append(acc_name)
-    except TInvestError:
-        pass
+    forbidden = _forbidden_identifiers(client)
 
     # 1) portfolio_snapshot.json
     ar = ArtifactResult("portfolio", "ok", str(out_dir / PORTFOLIO_JSON))
@@ -331,3 +328,93 @@ def run_export(client: TInvestClient, *, export_dir: str | None = None,
     status["generated_at"] = now
     _atomic_write(out_dir / STATUS_JSON, _json_text(status))
     return ExportResult(str(out_dir), str(out_dir / STATUS_JSON), results)
+
+
+# ===================== исходящий push снимка в Mini App =====================
+# Только чтение T-Invest + обезличенный POST. Никаких торговых вызовов.
+
+@dataclass
+class PushResult:
+    status: str    # accepted | unchanged | error | network
+    code: int
+    message: str
+
+
+def _forbidden_identifiers(client: TInvestClient) -> list[str]:
+    """acc_id (всегда) + имя счёта, если оно НЕ родовой ярлык типа счёта."""
+    try:
+        acc_id, acc_name = client.resolve_account()
+    except TInvestError:
+        return []
+    out = [acc_id]
+    if acc_name and acc_name not in _GENERIC_ACCOUNT_NAMES:
+        out.append(acc_name)
+    return out
+
+
+def _push_err_text(r) -> str:
+    try:
+        return (r.text or "")[:200]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# Коды, которые НЕ повторяем автоматически (контракт/доступ/данные).
+_PUSH_NO_RETRY = {401, 409, 413, 415, 422}
+
+
+def push_snapshot(url: str, secret: str, json_text: str, *,
+                  attempts: int = 3, timeout: int = 15,
+                  sleep=time.sleep) -> PushResult:
+    """POST снимка на ingest-приёмник Mini App (контракт Codex).
+
+    202 → accepted (новый снимок), 200 → unchanged (уже сохранён) — оба успех.
+    401/409/413/415/422 — НЕ повторяем (проблема контракта/доступа/данных).
+    Сеть/429/5xx — повтор с задержкой. Секрет НЕ логируем и в сообщение не кладём.
+    """
+    headers = {"Authorization": f"Bearer {secret}",
+               "Content-Type": "application/json"}
+    body = json_text.encode("utf-8")
+    backoff = [3, 8]                      # задержки перед 2-й и 3-й попыткой, сек
+    last = PushResult("error", 0, "не отправлено")
+    for i in range(attempts):
+        try:
+            r = requests.post(url, data=body, headers=headers, timeout=timeout)
+        except requests.RequestException as e:
+            last = PushResult("network", 0, str(e))
+            if i < attempts - 1:
+                sleep(backoff[min(i, len(backoff) - 1)])
+                continue
+            return last
+        code = r.status_code
+        if code == 202:
+            return PushResult("accepted", 202, "новый снимок сохранён")
+        if code == 200:
+            return PushResult("unchanged", 200, "снимок не изменился")
+        if code in _PUSH_NO_RETRY:
+            return PushResult("error", code, _push_err_text(r))
+        if code == 429 or 500 <= code < 600:
+            last = PushResult("error", code, _push_err_text(r))
+            if i < attempts - 1:
+                sleep(backoff[min(i, len(backoff) - 1)])
+                continue
+            return last
+        return PushResult("error", code, _push_err_text(r))   # прочее — не повторяем
+    return last
+
+
+def export_and_push_portfolio(client: TInvestClient, *, url: str, secret: str,
+                              export_dir: str | None = None,
+                              coupon_lookahead_days: int = 180,
+                              sleep=time.sleep) -> tuple[PushResult, dict]:
+    """Собрать СВЕЖИЙ снимок портфеля, атомарно записать локально и запушить.
+
+    Скруббер секретов — перед отправкой. Возвращает (результат_пуша, снимок).
+    """
+    out_dir = Path(export_dir) if export_dir else (DATA_DIR / "export")
+    snap = build_portfolio_snapshot(client, coupon_lookahead_days)
+    text = _json_text(snap)
+    _assert_no_secrets(text, _forbidden_identifiers(client))
+    _atomic_write(out_dir / PORTFOLIO_JSON, text)
+    res = push_snapshot(url, secret, text, sleep=sleep)
+    return res, snap

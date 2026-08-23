@@ -5,6 +5,7 @@
     python main.py --check   — проверить токен и подключение к T-Invest API
     python main.py --accounts — вывести список доступных счетов
     python main.py --export  — read-only выгрузка снимков (portfolio/allowlist/fundamentals)
+    python main.py --push    — разово отправить снимок портфеля в приёмник Mini App
 """
 from __future__ import annotations
 
@@ -54,6 +55,20 @@ def main():
         for a in res.artifacts:
             print(f"{a.name}: {a.status} (строк {a.rows}) {a.error}".rstrip())
         print(f"Папка: {res.dir}")
+        return
+
+    if "--push" in sys.argv:
+        from bot import snapshot_export
+        if not (cfg.export_push_enabled and cfg.export_push_url
+                and cfg.export_push_secret):
+            print("Push выключен/не настроен: нужны export_push_enabled + "
+                  "export_push_url (config.yaml) и EXPORT_PUSH_SECRET (.env).")
+            return
+        res, _ = snapshot_export.export_and_push_portfolio(
+            tinvest, url=cfg.export_push_url, secret=cfg.export_push_secret,
+            export_dir=cfg.export_dir or None,
+            coupon_lookahead_days=cfg.coupon_lookahead_days)
+        print(f"push: {res.status} ({res.code}) {res.message}")
         return
 
     log.info("ИИС-бот v%s — старт", __version__)

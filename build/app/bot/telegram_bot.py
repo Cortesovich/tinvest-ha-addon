@@ -24,6 +24,7 @@ log = logging.getLogger("telegram")
 API = "https://api.telegram.org/bot{token}/{method}"
 ORDERS_LOG = DATA_DIR / "orders.log"
 AUTOBUY_STATE = DATA_DIR / "autobuy_last.txt"   # дата последней автопокупки (защита от повтора)
+PUSH_STATE = DATA_DIR / "push_last.txt"         # дата последнего ежедневного push снимка
 
 _WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
@@ -161,7 +162,12 @@ class TelegramBot:
             fundamentals_scope=self.cfg.export_fundamentals_scope,
             stock_whitelist=self.cfg.stock_whitelist,
         )
-        self.send(chat_id, fmt.format_export_summary(res))
+        msg = fmt.format_export_summary(res)
+        if self._push_enabled():
+            pr = self._push_portfolio_quiet("вручную /export")
+            if pr is not None:
+                msg += f"\n\n📤 Push в приложение: {fmt.esc(pr.status)} ({pr.code})"
+        self.send(chat_id, msg)
 
     def _cmd_reinvest(self, chat_id: int):
         self.send(chat_id, "Подбираю облигации, это займёт до минуты…")
@@ -366,6 +372,7 @@ class TelegramBot:
                   f"Свободно было: {fmt._num(free)} ₽\n\n")
         self._notify_owners(header + fmt.format_order_report(results))
         log.info("Автопокупка: отправлено заявок %d", len(results))
+        self._push_portfolio_quiet("после автопокупки")   # обновить снимок в приложении
 
     def _autobuy_last(self) -> str:
         try:
@@ -379,6 +386,68 @@ class TelegramBot:
         except Exception:  # noqa: BLE001
             log.exception("Не удалось записать autobuy_last.txt")
 
+    # ================= АВТООБНОВЛЕНИЕ Mini App (push снимка портфеля) =========
+    def _push_enabled(self) -> bool:
+        c = self.cfg
+        return bool(c.export_push_enabled and c.export_push_url
+                    and c.export_push_secret)
+
+    def _push_portfolio_quiet(self, reason: str):
+        """Собрать свежий снимок портфеля и отправить в приёмник Mini App.
+
+        Тихо: успех / сеть / 5xx — только в лог; про НЕповторяемую ошибку
+        (неверный секрет/URL/данные) — одно сообщение владельцам, чтобы починили.
+        Секрет нигде не логируется. Только чтение + исходящий POST.
+        """
+        if not self._push_enabled():
+            return None
+        try:
+            res, _ = snapshot_export.export_and_push_portfolio(
+                self.tinvest, url=self.cfg.export_push_url,
+                secret=self.cfg.export_push_secret,
+                export_dir=self.cfg.export_dir or None,
+                coupon_lookahead_days=self.cfg.coupon_lookahead_days)
+        except Exception:  # noqa: BLE001
+            log.exception("Push портфеля (%s) не удался", reason)
+            return None
+        log.info("Push портфеля (%s): %s (%s)", reason, res.status, res.code)
+        if res.status == "error" and res.code in (401, 409, 413, 415, 422):
+            self._notify_owners(
+                f"📤 Автообновление приложения: приёмник ответил {res.code} — "
+                "снимок не принят, приложение может показывать устаревшие данные. "
+                "Проверь URL/секрет приёмника.")
+        return res
+
+    def _maybe_push(self):
+        """Ежедневный push снимка портфеля в приёмник Mini App (раз в день)."""
+        if not self._push_enabled():
+            return
+        try:
+            now = datetime.now(fmt._zone(self.cfg.timezone))
+            today = now.strftime("%Y-%m-%d")
+            if self._push_last() == today:          # уже отправляли сегодня
+                return
+            hh, mm = _parse_hhmm(self.cfg.export_push_time)
+            if (now.hour, now.minute) < (hh, mm):   # время ещё не наступило
+                return
+            self._set_push_last(today)              # помечаем ДО — не повторять за день
+            log.info("Push портфеля: ежедневный (%s %s)", today, self.cfg.export_push_time)
+            self._push_portfolio_quiet("ежедневный")
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка планировщика push")
+
+    def _push_last(self) -> str:
+        try:
+            return PUSH_STATE.read_text(encoding="utf-8").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _set_push_last(self, day: str):
+        try:
+            PUSH_STATE.write_text(day, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось записать push_last.txt")
+
     # ================= ОСНОВНОЙ ЦИКЛ =================
     def run(self):
         mode = "ТОРГОВЛЯ ВКЛ" if self.cfg.trade_enabled else "только чтение"
@@ -387,6 +456,8 @@ class TelegramBot:
                      f"{self.cfg.autobuy_time} (от {self.cfg.autobuy_min_cash:.0f}₽)")
         if self.cfg.viewer_chat_ids:
             mode += f", наблюдателей: {len(self.cfg.viewer_chat_ids)}"
+        if self._push_enabled():
+            mode += f", push приложения {self.cfg.export_push_time}"
         log.info("Бот запущен (%s), ожидаю команды…", mode)
         while True:
             try:
@@ -417,6 +488,7 @@ class TelegramBot:
 
             # планировщик автопокупки (проверяется на каждой итерации, ~раз в poll_timeout)
             self._maybe_autobuy()
+            self._maybe_push()
 
 
 def _log_order(order_id, name, figi, lots, status):
