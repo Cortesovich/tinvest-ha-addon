@@ -24,7 +24,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -333,11 +333,17 @@ def run_export(client: TInvestClient, *, export_dir: str | None = None,
 # ===================== исходящий push снимка в Mini App =====================
 # Только чтение T-Invest + обезличенный POST. Никаких торговых вызовов.
 
+SCHEMA_V2 = "portfolio_snapshot.v2"
+PORTFOLIO_V2_JSON = "portfolio_snapshot.v2.json"
+ASOF_STATE = "push_asof.txt"          # монотонный as_of последнего push
+
+
 @dataclass
 class PushResult:
-    status: str    # accepted | unchanged | error | network
-    code: int
-    message: str
+    status: str        # accepted | unchanged | error | network (наша категория)
+    code: int          # HTTP-код (0 если сеть)
+    message: str = ""
+    result: str = ""   # 'status'/'error' из тела приёмника (accepted/stale_snapshot/…)
 
 
 def _forbidden_identifiers(client: TInvestClient) -> list[str]:
@@ -352,69 +358,175 @@ def _forbidden_identifiers(client: TInvestClient) -> list[str]:
     return out
 
 
-def _push_err_text(r) -> str:
-    try:
-        return (r.text or "")[:200]
-    except Exception:  # noqa: BLE001
-        return ""
-
-
 # Коды, которые НЕ повторяем автоматически (контракт/доступ/данные).
 _PUSH_NO_RETRY = {401, 409, 413, 415, 422}
 
 
-def push_snapshot(url: str, secret: str, json_text: str, *,
+def _parse_ingest_body(r) -> tuple[str, str | None]:
+    """Из ответа приёмника — result ('status'/'error') и received_at.
+    Суммы портфеля из тела в лог НЕ тянем."""
+    try:
+        b = r.json()
+    except Exception:  # noqa: BLE001
+        return "", None
+    if not isinstance(b, dict):
+        return "", None
+    return (str(b.get("status") or b.get("error") or ""), b.get("received_at"))
+
+
+def _log_ingest(http, result: str, as_of: str, received_at) -> None:
+    # безопасная строка: без секрета и без сумм портфеля
+    log.info("mini_app_ingest status=%s result=%s as_of=%s schema=%s received_at=%s",
+             http, result or "-", as_of or "null", SCHEMA_V2, received_at or "null")
+
+
+def push_snapshot(url: str, secret: str, json_text: str, *, as_of: str = "",
                   attempts: int = 3, timeout: int = 15,
                   sleep=time.sleep) -> PushResult:
     """POST снимка на ingest-приёмник Mini App (контракт Codex).
 
-    202 → accepted (новый снимок), 200 → unchanged (уже сохранён) — оба успех.
-    401/409/413/415/422 — НЕ повторяем (проблема контракта/доступа/данных).
-    Сеть/429/5xx — повтор с задержкой. Секрет НЕ логируем и в сообщение не кладём.
+    202 accepted / 200 unchanged — успех. 401/409/413/415/422 — НЕ повторяем
+    (контракт/доступ/данные). Сеть/429/5xx — повтор с задержкой. Секрет НЕ
+    логируем; в лог — безопасная строка mini_app_ingest без секрета и сумм.
     """
     headers = {"Authorization": f"Bearer {secret}",
                "Content-Type": "application/json"}
     body = json_text.encode("utf-8")
     backoff = [3, 8]                      # задержки перед 2-й и 3-й попыткой, сек
-    last = PushResult("error", 0, "не отправлено")
+    out = last = PushResult("error", 0, "не отправлено")
     for i in range(attempts):
+        received_at = None
         try:
             r = requests.post(url, data=body, headers=headers, timeout=timeout)
         except requests.RequestException as e:
-            last = PushResult("network", 0, str(e))
-            if i < attempts - 1:
-                sleep(backoff[min(i, len(backoff) - 1)])
-                continue
-            return last
-        code = r.status_code
-        if code == 202:
-            return PushResult("accepted", 202, "новый снимок сохранён")
-        if code == 200:
-            return PushResult("unchanged", 200, "снимок не изменился")
-        if code in _PUSH_NO_RETRY:
-            return PushResult("error", code, _push_err_text(r))
-        if code == 429 or 500 <= code < 600:
-            last = PushResult("error", code, _push_err_text(r))
-            if i < attempts - 1:
-                sleep(backoff[min(i, len(backoff) - 1)])
-                continue
-            return last
-        return PushResult("error", code, _push_err_text(r))   # прочее — не повторяем
+            out = last = PushResult("network", 0, str(e)[:200], "network_error")
+            retryable = True
+        else:
+            code = r.status_code
+            result, received_at = _parse_ingest_body(r)
+            if code == 202:
+                out, retryable = PushResult("accepted", 202, "новый снимок",
+                                            result or "accepted"), False
+            elif code == 200:
+                out, retryable = PushResult("unchanged", 200, "не изменился",
+                                            result or "unchanged"), False
+            elif code in _PUSH_NO_RETRY:
+                out, retryable = PushResult("error", code, "", result), False
+            elif code == 429 or 500 <= code < 600:
+                out = last = PushResult("error", code, "", result)
+                retryable = True
+            else:
+                out, retryable = PushResult("error", code, "", result), False
+        if retryable and i < attempts - 1:
+            sleep(backoff[min(i, len(backoff) - 1)])
+            continue
+        _log_ingest(out.code, out.result or out.status, as_of, received_at)
+        return out
+    _log_ingest(last.code, last.result or last.status, as_of, None)
     return last
+
+
+def _next_push_as_of(out_dir: Path) -> str:
+    """Монотонный as_of: время сейчас, но строго больше предыдущего (при
+    совпадении/откате — предыдущий + 1с). Пишем ДО отправки."""
+    p = out_dir / ASOF_STATE
+    now = _utc_now_iso()
+    try:
+        last = p.read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        last = ""
+    if last and now <= last:
+        try:
+            dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc)
+            now = (dt + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            pass
+    try:
+        _atomic_write(p, now + "\n")
+    except Exception:  # noqa: BLE001
+        log.warning("Не удалось записать push_asof.txt")
+    return now
+
+
+def _build_performance(client: TInvestClient, tax_refund_amounts, as_of: str):
+    """performance из готового расчёта /income (compute_return), БЕЗ пересчёта
+    формулы. Если XIRR не вычислен — None. performance.as_of == корневому as_of."""
+    try:
+        r = client.compute_return(tax_refund_amounts or [])
+    except TInvestError as e:
+        log.warning("performance недоступен: %s", e)
+        return None
+    if r.xirr_pct is None:
+        return None
+    return {
+        "method": "xirr",
+        "calculated_from": _iso(r.since) if r.since else None,
+        "as_of": as_of,
+        "annualized_return": round(float(r.xirr_pct) / 100.0, 6),
+        "net_contributions": _num(r.contributed - r.withdrawn),
+        "profit": _num(r.profit),
+        "coupons": _num(r.coupons),
+        "tax_deductions": _num(r.tax_refund),
+        "currency": r.currency,
+    }
+
+
+def build_snapshot_v2(client: TInvestClient, *, coupon_lookahead_days: int = 180,
+                      tax_refund_amounts=None, as_of: str) -> dict:
+    """Снимок v2 для Mini App: v1 + schema_version + performance + поля позиций.
+
+    Локальный v1 (вход скоринг-модуля) НЕ меняем — v2 идёт только в push.
+    unit_price — цена одной бумаги в RUB (market_value/кол-во). issuer_name и
+    coupon_rate — null: у API нет надёжного прямого поля (контракт допускает null).
+    """
+    v1 = build_portfolio_snapshot(client, coupon_lookahead_days)
+    positions = []
+    for p in v1["positions"]:
+        qty = p["quantity"]
+        mv = p["market_value"]
+        unit_price = round(mv / qty, 4) if qty else None
+        positions.append({
+            "instrument_type": p["instrument_type"],
+            "secid": p["secid"],
+            "name": p["name"],
+            "issuer_name": None,
+            "quantity": qty,
+            "market_value": mv,
+            "unit_price": unit_price,
+            "coupon_rate": None,
+        })
+    return {
+        "schema_version": SCHEMA_V2,
+        "as_of": as_of,
+        "currency": v1["currency"],
+        "cash_value": v1["cash_value"],
+        "positions": positions,
+        "payments": v1["payments"],
+        "performance": _build_performance(client, tax_refund_amounts, as_of),
+        "source": {
+            "kind": "live_read_only",
+            "description": "Обезличенный read-only снимок портфеля",
+            "loaded_at": _utc_now_iso(),
+        },
+    }
 
 
 def export_and_push_portfolio(client: TInvestClient, *, url: str, secret: str,
                               export_dir: str | None = None,
                               coupon_lookahead_days: int = 180,
+                              tax_refund_amounts=None,
                               sleep=time.sleep) -> tuple[PushResult, dict]:
-    """Собрать СВЕЖИЙ снимок портфеля, атомарно записать локально и запушить.
-
-    Скруббер секретов — перед отправкой. Возвращает (результат_пуша, снимок).
+    """Собрать СВЕЖИЙ снимок v2, записать локально (portfolio_snapshot.v2.json,
+    НЕ трогая v1) и запушить с монотонным as_of. Скруббер — перед отправкой.
     """
     out_dir = Path(export_dir) if export_dir else (DATA_DIR / "export")
-    snap = build_portfolio_snapshot(client, coupon_lookahead_days)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    as_of = _next_push_as_of(out_dir)
+    snap = build_snapshot_v2(client, coupon_lookahead_days=coupon_lookahead_days,
+                             tax_refund_amounts=tax_refund_amounts, as_of=as_of)
     text = _json_text(snap)
     _assert_no_secrets(text, _forbidden_identifiers(client))
-    _atomic_write(out_dir / PORTFOLIO_JSON, text)
-    res = push_snapshot(url, secret, text, sleep=sleep)
+    _atomic_write(out_dir / PORTFOLIO_V2_JSON, text)
+    res = push_snapshot(url, secret, text, as_of=as_of, sleep=sleep)
     return res, snap

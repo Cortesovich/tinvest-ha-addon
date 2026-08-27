@@ -67,8 +67,9 @@ def main():
         res, _ = snapshot_export.export_and_push_portfolio(
             tinvest, url=cfg.export_push_url, secret=cfg.export_push_secret,
             export_dir=cfg.export_dir or None,
-            coupon_lookahead_days=cfg.coupon_lookahead_days)
-        print(f"push: {res.status} ({res.code}) {res.message}")
+            coupon_lookahead_days=cfg.coupon_lookahead_days,
+            tax_refund_amounts=cfg.tax_refund_amounts)
+        print(f"push: {res.status} ({res.code}) {res.result or res.message}")
         return
 
     log.info("ИИС-бот v%s — старт", __version__)

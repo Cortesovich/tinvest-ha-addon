@@ -406,7 +406,8 @@ class TelegramBot:
                 self.tinvest, url=self.cfg.export_push_url,
                 secret=self.cfg.export_push_secret,
                 export_dir=self.cfg.export_dir or None,
-                coupon_lookahead_days=self.cfg.coupon_lookahead_days)
+                coupon_lookahead_days=self.cfg.coupon_lookahead_days,
+                tax_refund_amounts=self.cfg.tax_refund_amounts)
         except Exception:  # noqa: BLE001
             log.exception("Push портфеля (%s) не удался", reason)
             return None
