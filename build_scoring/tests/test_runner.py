@@ -91,6 +91,16 @@ def test_find_value_nested():
     assert sr._find_value({"a": 1}, "missing") is None
 
 
+def test_resolve_quality_mode_fail_closed():
+    # quality включён + файл есть → присоединяем
+    assert sr.resolve_quality_mode(True, True) == "attach"
+    # quality включён, файла НЕТ → стоп (fail-closed), НЕ market-only молча
+    assert sr.resolve_quality_mode(True, False) == "abort"
+    # quality явно выключен → market-only (с файлом или без)
+    assert sr.resolve_quality_mode(False, False) == "market_only"
+    assert sr.resolve_quality_mode(False, True) == "market_only"
+
+
 def test_categorize_publish():
     assert sr.categorize_publish(202) == "OK"
     assert sr.categorize_publish(200) == "OK"

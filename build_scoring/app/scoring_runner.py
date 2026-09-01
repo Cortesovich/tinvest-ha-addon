@@ -205,6 +205,18 @@ def categorize_publish(status: int) -> str:
     return "TERMINAL"                              # 3xx и прочее — неожиданно
 
 
+def resolve_quality_mode(use_quality: bool, file_exists: bool) -> str:
+    """Fail-closed по фундаменталу:
+      'attach'      — quality включён и файл есть → присоединяем;
+      'abort'       — quality включён, но файла НЕТ → НЕ публикуем (стоп), а не
+                      молча выкидываем фундаментал из более нового снимка;
+      'market_only' — quality явно выключен → рыночный снимок без фундаментала.
+    """
+    if use_quality:
+        return "attach" if file_exists else "abort"
+    return "market_only"
+
+
 # ------------------------------- состояние ----------------------------------
 
 def load_state() -> dict:
@@ -289,19 +301,30 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# Явный User-Agent: дефолтный `Python-urllib/x` режется Cloudflare (403, error
+# 1010). Значение Worker не проверяет — это стабильный id read-only клиента.
+_USER_AGENT = "TInvest-Scoring-ReadOnly/0.3.1"
+
+
 def publish(body: bytes, cfg: Config):
-    """(category, status, result_text). Секрет и заголовки НЕ логируем."""
+    """(category, status, result_text). Секрет/тело запроса НЕ логируем; при
+    не-OK пишем безопасно status + CF-Ray + первые 300 символов тела ответа."""
     req = urllib.request.Request(
         cfg.ingest_url, data=body, method="POST",
         headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {cfg.secret}"})
+                 "Authorization": f"Bearer {cfg.secret}",
+                 "Accept": "application/json",
+                 "User-Agent": _USER_AGENT})
     opener = urllib.request.build_opener(_NoRedirect)
+    cf_ray = None
     try:
         with opener.open(req, timeout=30) as resp:
             status = resp.status
+            cf_ray = resp.headers.get("CF-Ray")
             text = resp.read(2048).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         status = e.code
+        cf_ray = e.headers.get("CF-Ray") if e.headers else None
         text = (e.read(2048).decode("utf-8", "replace") if e.fp else "")
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         log.warning("publish сеть/таймаут: %s", str(e)[:200])
@@ -313,21 +336,22 @@ def publish(body: bytes, cfg: Config):
             result = str(b.get("status") or b.get("error") or "")
     except Exception:  # noqa: BLE001
         pass
-    return categorize_publish(status), status, result
+    cat = categorize_publish(status)
+    if cat != "OK":
+        log.warning("publish HTTP %s CF-Ray=%s body=%s", status, cf_ray or "-",
+                    (text or "").replace("\n", " ")[:300])
+    return cat, status, result
 
 
 # ------------------------------- один запуск --------------------------------
 
-def _prepare_run_dir(as_of: str, cfg: Config):
+def _prepare_run_dir(as_of: str) -> Path:
     now = datetime.now(timezone.utc)
     run_dir = RUNS / f"{as_of}T{now:%H%M%S}Z"
     run_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(UNIVERSE_SRC, run_dir / "tbank_iis_universe.csv")
     shutil.copy2(ALLOWLIST_SRC, run_dir / "iis_allowlist_current.csv")
-    use_quality = cfg.use_quality and QUALITY_SRC.exists()
-    if use_quality:
-        shutil.copy2(QUALITY_SRC, run_dir / "quality_snapshot.json")
-    return run_dir, use_quality
+    return run_dir
 
 
 def compute(as_of: str, cfg: Config) -> bytes | None:
@@ -345,7 +369,20 @@ def compute(as_of: str, cfg: Config) -> bytes | None:
             log.error("Вход %s несвежий: %s", name, why)
             return None
 
-    run_dir, use_quality = _prepare_run_dir(as_of, cfg)
+    # Fail-closed по фундаменталу ДО расчёта: quality включён без файла → стоп.
+    qmode = resolve_quality_mode(cfg.use_quality, QUALITY_SRC.exists())
+    if qmode == "abort":
+        log.error("quality включён, но файла нет (%s) — публикация остановлена "
+                  "(fail-closed). Положите quality_snapshot на Pi или явно "
+                  "выключите use_quality_snapshot для market-only.", QUALITY_SRC)
+        return None
+
+    run_dir = _prepare_run_dir(as_of)
+    if qmode == "attach":
+        shutil.copy2(QUALITY_SRC, run_dir / "quality_snapshot.json")
+    else:
+        log.info("Явный market-only режим (use_quality_snapshot=false)")
+
     cand = run_dir / "iis_share_candidates.csv"
     rc = run_cli(["iis-candidates", "--as-of", as_of,
                   "--tbank-universe", str(run_dir / "tbank_iis_universe.csv"),
@@ -358,10 +395,8 @@ def compute(as_of: str, cfg: Config) -> bytes | None:
     mr = ["market-refresh", "--as-of", as_of, "--base-precheck", str(cand),
           "--methodology", str(METHODOLOGY), "--workers", str(cfg.workers),
           "--output-dir", str(market)]
-    if use_quality:
+    if qmode == "attach":
         mr += ["--quality-snapshot", str(run_dir / "quality_snapshot.json")]
-    else:
-        log.info("quality_snapshot отсутствует/выключен — market-only режим")
     if run_cli(mr, cfg.attempt_timeout) != 0:
         errf = market / "download-errors.json"
         if errf.exists():

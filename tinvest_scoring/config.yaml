@@ -1,5 +1,5 @@
 name: TInvest Скоринг (акции)
-version: "0.3.1"
+version: "0.3.2"
 slug: tinvest_scoring
 description: >-
   Отдельный read-only процесс: считает рыночный профиль акций ИИС по публичным
