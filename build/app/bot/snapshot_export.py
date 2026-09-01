@@ -1,9 +1,10 @@
 """Read-only экспортёр обезличенных снимков для модуля скоринга и Mini App.
 
-Три артефакта в папке экспорта (по умолчанию DATA_DIR/export):
+Четыре артефакта в папке экспорта (по умолчанию DATA_DIR/export):
   1) portfolio_snapshot.json    — форма входа --portfolio-snapshot прототипа;
   2) iis_allowlist_current.csv  — текущая ИИС-доступность инструментов;
-  3) tbank_fundamentals_raw.csv — сырые поля GetAssetFundamentals (диагностика).
+  3) tbank_fundamentals_raw.csv — сырые поля GetAssetFundamentals (диагностика);
+  4) tbank_iis_universe.csv     — каталог акций (метаданные) для скоринга v0.3.
 
 Плюс export_status.json — единственный источник правды о свежести (ok / stale /
 not_connected по каждому артефакту).
@@ -38,6 +39,7 @@ log = logging.getLogger("export")
 PORTFOLIO_JSON = "portfolio_snapshot.json"
 ALLOWLIST_CSV = "iis_allowlist_current.csv"
 FUNDAMENTALS_CSV = "tbank_fundamentals_raw.csv"
+UNIVERSE_CSV = "tbank_iis_universe.csv"
 STATUS_JSON = "export_status.json"
 
 _ALLOWLIST_HEADER = ["observed_at", "secid", "isin", "figi", "instrument_type",
@@ -45,6 +47,9 @@ _ALLOWLIST_HEADER = ["observed_at", "secid", "isin", "figi", "instrument_type",
                      "sell_available", "source_method", "notes"]
 _FUND_HEADER = ["observed_at", "secid", "isin", "api_field", "api_value",
                 "unit", "period", "source_method", "notes"]
+# Каталог акций для скоринга v0.3 (контракт Codex): ровно эти 9 колонок.
+_UNIVERSE_HEADER = ["ticker", "isin", "class_code", "name", "share_type",
+                    "sector", "currency", "for_iis_flag", "generated_at"]
 
 # Явная маркировка: снимок текущий, не доказывает доступность на ретро-дату.
 _ALLOWLIST_NOTE = "current_snapshot; not_proof_of_availability_on_2026-06-30"
@@ -242,6 +247,34 @@ def build_fundamentals_rows(client: TInvestClient,
     return out
 
 
+def build_universe_rows(client: TInvestClient) -> list[list]:
+    """Каталог акций (InstrumentsService.Shares, INSTRUMENT_STATUS_BASE) — v0.3.
+
+    Только метаданные, ТОЛЬКО ЧТЕНИЕ: без цен, позиций, счёта. for_iis_flag —
+    колонка, а не фильтр: витрина/скоринг сами решают, что оставить. Пропускаем
+    бумаги без тикера (нечем джойнить). generated_at — один момент на всю пачку.
+    """
+    now = _utc_now_iso()
+    out: list[list] = []
+    for s in client._all_shares():
+        ticker = (s.get("ticker") or "").strip()
+        if not ticker:
+            continue
+        out.append([
+            ticker,
+            s.get("isin") or "",
+            s.get("classCode") or "",
+            s.get("name") or "",
+            s.get("shareType") or "",
+            s.get("sector") or "",
+            (s.get("currency") or "").lower(),
+            _flag(s.get("forIisFlag")),
+            now,
+        ])
+    out.sort(key=lambda x: (x[0], x[2]))   # ticker, class_code
+    return out
+
+
 # ----------------------------- оркестрация ---------------------------------
 
 def _read_status(path: Path) -> dict:
@@ -323,6 +356,19 @@ def run_export(client: TInvestClient, *, export_dir: str | None = None,
         ar.status, ar.error = "error", str(e)
         _apply_err(status, "fundamentals", now, str(e))
         log.warning("Экспорт fundamentals не удался: %s", e)
+    results.append(ar)
+
+    # 4) tbank_iis_universe.csv — каталог акций для скоринга v0.3
+    ar = ArtifactResult("universe", "ok", str(out_dir / UNIVERSE_CSV))
+    try:
+        rows = build_universe_rows(client)
+        _atomic_write(out_dir / UNIVERSE_CSV, _csv_text(_UNIVERSE_HEADER, rows))
+        ar.rows = len(rows)
+        _apply_ok(status, "universe", now)
+    except Exception as e:  # noqa: BLE001
+        ar.status, ar.error = "error", str(e)
+        _apply_err(status, "universe", now, str(e))
+        log.warning("Экспорт universe не удался: %s", e)
     results.append(ar)
 
     status["generated_at"] = now

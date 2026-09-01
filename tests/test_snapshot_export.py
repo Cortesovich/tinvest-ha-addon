@@ -91,6 +91,24 @@ class FakeClient:
         return [{"secid": "SBER", "isin": "RU0009029540",
                  "api_field": "roe", "api_value": 0.24}]
 
+    def _all_shares(self):
+        # каталог акций для universe: RUB/нерубль, ИИС true/false, дубль тикера
+        # по class_code, одна бумага без тикера (должна выпасть), валюта в верхнем
+        # регистре (должна опуститься в нижний).
+        return [
+            {"ticker": "SBER", "isin": "RU0009029540", "classCode": "TQBR",
+             "name": "Сбербанк", "shareType": "SHARE_TYPE_COMMON",
+             "sector": "financial", "currency": "rub", "forIisFlag": True},
+            {"ticker": "SBERP", "isin": "RU0009029557", "classCode": "TQBR",
+             "name": "Сбербанк-п", "shareType": "SHARE_TYPE_PREFERRED",
+             "sector": "financial", "currency": "rub", "forIisFlag": True},
+            {"ticker": "AAPL", "isin": "US0378331005", "classCode": "SPBXM",
+             "name": "Apple", "shareType": "SHARE_TYPE_COMMON",
+             "sector": "it", "currency": "USD", "forIisFlag": False},
+            {"ticker": "", "isin": "X", "classCode": "Y", "name": "no ticker",
+             "currency": "rub", "forIisFlag": True},   # без тикера → пропуск
+        ]
+
 
 # ------------------------------- портфель ---------------------------------
 
@@ -123,10 +141,11 @@ def test_run_export_writes_all_three(tmp_path):
     res = se.run_export(FakeClient(), export_dir=str(tmp_path),
                         fundamentals_scope="whitelist", stock_whitelist=["SBER"])
     assert {a.name: a.status for a in res.artifacts} == {
-        "portfolio": "ok", "allowlist": "ok", "fundamentals": "ok"}
-    # три файла + статус
+        "portfolio": "ok", "allowlist": "ok", "fundamentals": "ok",
+        "universe": "ok"}
+    # четыре файла + статус
     for fn in (se.PORTFOLIO_JSON, se.ALLOWLIST_CSV, se.FUNDAMENTALS_CSV,
-               se.STATUS_JSON):
+               se.UNIVERSE_CSV, se.STATUS_JSON):
         assert (tmp_path / fn).exists()
     # JSON детерминирован: sort_keys + перевод строки в конце
     txt = (tmp_path / se.PORTFOLIO_JSON).read_text(encoding="utf-8")
@@ -137,8 +156,33 @@ def test_run_export_writes_all_three(tmp_path):
     csv_lines = (tmp_path / se.ALLOWLIST_CSV).read_text(encoding="utf-8").splitlines()
     sber = [ln for ln in csv_lines if ln.startswith("") and "SBER" in ln][0]
     assert sber.split(",")[6:9] == ["true", "true", ""]  # trade, buy, sell(пусто)
+    # universe: ровно заголовок из _UNIVERSE_HEADER, статус ok
+    uni = (tmp_path / se.UNIVERSE_CSV).read_text(encoding="utf-8").splitlines()
+    assert uni[0] == ",".join(se._UNIVERSE_HEADER)
     status = json.loads((tmp_path / se.STATUS_JSON).read_text(encoding="utf-8"))
     assert status["portfolio"]["status"] == "ok"
+    assert status["universe"]["status"] == "ok"
+
+
+def test_universe_rows_shape_sort_and_flag():
+    rows = se.build_universe_rows(FakeClient())
+    # бумага без тикера выпала; отсортировано по тикеру
+    assert [r[0] for r in rows] == ["AAPL", "SBER", "SBERP"]
+    assert all(len(r) == len(se._UNIVERSE_HEADER) == 9 for r in rows)
+    aapl = rows[0]
+    assert aapl[2] == "SPBXM"                 # class_code
+    assert aapl[3] == "Apple"                 # name
+    assert aapl[4] == "SHARE_TYPE_COMMON"     # share_type
+    assert aapl[5] == "it"                    # sector
+    assert aapl[6] == "usd"                   # currency опущен в нижний регистр
+    assert aapl[7] == "false"                 # forIisFlag=False → 'false'
+    assert rows[1][7] == "true"               # SBER forIisFlag=True → 'true'
+    # generated_at — один момент на всю пачку
+    assert len({r[8] for r in rows}) == 1
+    # без счёта/позиций/цен: только метаданные каталога
+    flat = ",".join(str(c) for r in rows for c in r)
+    for banned in ("figi", "quantity", "market_value", ACC_ID, ACC_NAME):
+        assert banned not in flat
 
 
 def test_error_does_not_clobber_good_file(tmp_path):
